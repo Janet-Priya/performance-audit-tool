@@ -1,0 +1,36 @@
+services:
+  target-api:
+    build: ./target-api
+    ports:
+      - "8000:8000"
+
+  manager-api:
+    build: ./manager-api
+    ports:
+      - "8001:8001"
+    environment:
+      AUDIT_DB_PATH: /data/results.db
+      AUDIT_CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080"
+      # UI often sends http://localhost:8000; inside Docker that is wrong — use the Compose service name.
+      AUDIT_REPLACE_LOCALHOST_TARGET: http://target-api:8000
+    volumes:
+      - manager_data:/data
+    depends_on:
+      - target-api
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        # REACT_APP_API_URL omitted = dashboard uses same-origin /api (nginx proxies to manager-api).
+        # Manager load-tests this URL from inside Docker (must be the Compose service name, not localhost).
+        REACT_APP_TARGET_URL: http://target-api:8000
+    ports:
+      - "3000:80"
+    depends_on:
+      - manager-api
+      - target-api
+
+volumes:
+  manager_data:

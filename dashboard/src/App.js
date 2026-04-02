@@ -13,17 +13,53 @@ import {
 import './App.css';
 
 /**
- * Always use an absolute manager URL. Relative `/api/...` breaks:
- * - `<a href>` / `window.open` from :3000 → browser requests :3000/api/… → SPA serves index.html (looks like a reload).
- * - `npm run build` + static server has no API proxy unless you add one.
- * Set REACT_APP_API_URL when the manager is not on 127.0.0.1:8001.
+ * Manager API base:
+ * - REACT_APP_API_URL if set (explicit base URL).
+ * - Development (`npm start`): http://127.0.0.1:8001 (CORS on manager).
+ * - Production build without REACT_APP_API_URL: same-origin `/api/...` (use nginx or another reverse proxy — see Docker).
+ * Set REACT_APP_API_URL when serving a static build without a proxy (e.g. http://127.0.0.1:8001).
  */
 const REACT_API_BASE = (process.env.REACT_APP_API_URL || '').replace(/\/$/, '');
 const MANAGER_ORIGIN = 'http://127.0.0.1:8001';
-const API_BASE = REACT_API_BASE || MANAGER_ORIGIN;
+/** Base URL of the service under test (browser → manager → target). Use http://target-api:8000 when both run in Docker Compose. */
+const DEFAULT_TARGET_URL = (process.env.REACT_APP_TARGET_URL || 'http://localhost:8000').replace(/\/$/, '');
 const apiUrl = (path) => {
   const p = path.startsWith('/') ? path : `/${path}`;
-  return `${API_BASE}${p}`;
+  if (REACT_API_BASE) return `${REACT_API_BASE}${p}`;
+  if (process.env.NODE_ENV === 'development') return `${MANAGER_ORIGIN}${p}`;
+  return p;
+};
+
+/** For user-facing hints: where the UI expects the API (direct URL, or same-origin in Docker/nginx). */
+const managerHintUrl = () => {
+  if (REACT_API_BASE) return REACT_API_BASE;
+  if (process.env.NODE_ENV === 'development') return MANAGER_ORIGIN;
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return `${window.location.origin} (paths under /api)`;
+  }
+  return MANAGER_ORIGIN;
+};
+
+const sampleHistoryUrl = () => {
+  if (REACT_API_BASE) return `${REACT_API_BASE}/api/tests/history`;
+  if (process.env.NODE_ENV === 'development') return `${MANAGER_ORIGIN}/api/tests/history`;
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return `${window.location.origin}/api/tests/history`;
+  }
+  return `${MANAGER_ORIGIN}/api/tests/history`;
+};
+
+const apiHeaders = () => {
+  const h = {};
+  const k = process.env.REACT_APP_AUDIT_API_KEY;
+  if (k) h['X-API-Key'] = k;
+  return h;
+};
+
+const formatTs = (ts) => {
+  if (!ts) return '—';
+  const s = String(ts);
+  return s.length >= 19 ? s.slice(0, 19).replace('T', ' ') : s;
 };
 
 const ENDPOINTS = ['/health', '/login', '/get-data', '/users', '/upload', '/search', '/notifications'];
@@ -56,37 +92,70 @@ export default function App() {
     ramp_steps: 5,
   });
   const [running, setRunning] = useState(false);
+  const [runProgress, setRunProgress] = useState(null);
   const [error, setError] = useState('');
+  const [managerHealth, setManagerHealth] = useState({ ok: true, message: '' });
   const [intelligence, setIntelligence] = useState(null);
   const [baselines, setBaselines] = useState([]);
+  const [historyFilter, setHistoryFilter] = useState({ q: '', status: '', from_ts: '', to_ts: '' });
+  const [historyPage, setHistoryPage] = useState(0);
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const historyLimit = 50;
+  /** Latest runs for the chart only (ignores table filters/pagination). */
+  const [trendHistory, setTrendHistory] = useState([]);
   const [brand, setBrand] = useState({
     app_title: 'Performance audit',
     app_subtitle: 'Load testing and latency insights',
   });
 
-  const fetchHistory = async () => {
+  const fetchHistory = async (pageOverride) => {
+    const page = pageOverride !== undefined ? pageOverride : historyPage;
     try {
-      const res = await fetch(apiUrl('/api/tests/history'));
+      const params = new URLSearchParams();
+      params.set('limit', String(historyLimit));
+      params.set('offset', String(page * historyLimit));
+      if (historyFilter.q.trim()) params.set('q', historyFilter.q.trim());
+      if (historyFilter.status.trim()) params.set('status', historyFilter.status.trim());
+      if (historyFilter.from_ts.trim()) params.set('from_ts', historyFilter.from_ts.trim());
+      if (historyFilter.to_ts.trim()) params.set('to_ts', historyFilter.to_ts.trim());
+      const res = await fetch(apiUrl(`/api/tests/history?${params}`), { headers: apiHeaders() });
       if (!res.ok) {
         setError(
-          `Manager API returned ${res.status}. Open ${MANAGER_ORIGIN}/api/tests/history in a new tab (should be JSON). Start: cd manager-api && uvicorn main:app --host 127.0.0.1 --port 8001 --reload`
+          `Manager API returned ${res.status}. Open ${sampleHistoryUrl()} in a new tab (should be JSON). Start the manager: see README (Docker: docker compose up --build; local: uvicorn in manager-api on port 8001).`
         );
         return;
       }
       const data = await res.json();
-      setHistory(data);
+      const items = data.items ?? data;
+      setHistory(Array.isArray(items) ? items : []);
+      setHistoryTotal(typeof data.total === 'number' ? data.total : items.length);
       setError('');
     } catch (e) {
       const hint = e?.message ? ` (${e.message})` : '';
       setError(
-        `Cannot reach the manager at ${MANAGER_ORIGIN}${hint}. Start it: cd manager-api && uvicorn main:app --host 127.0.0.1 --port 8001 --reload — then open ${MANAGER_ORIGIN}/api/tests/history in your browser (should show JSON).`
+        `Cannot reach the manager (${managerHintUrl()})${hint}. Start it: from repo root run docker compose up --build, or cd manager-api && uvicorn main:app --host 127.0.0.1 --port 8001 — then reload this page.`
       );
+    }
+  };
+
+  const fetchTrendHistory = async () => {
+    try {
+      const params = new URLSearchParams();
+      params.set('limit', '15');
+      params.set('offset', '0');
+      const res = await fetch(apiUrl(`/api/tests/history?${params}`), { headers: apiHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+      const items = data.items ?? [];
+      setTrendHistory(Array.isArray(items) ? items : []);
+    } catch (_) {
+      setTrendHistory([]);
     }
   };
 
   const fetchBaselines = async () => {
     try {
-      const res = await fetch(apiUrl('/api/baselines'));
+      const res = await fetch(apiUrl('/api/baselines'), { headers: apiHeaders() });
       if (res.ok) setBaselines(await res.json());
     } catch (_) {
       setBaselines([]);
@@ -95,10 +164,11 @@ export default function App() {
 
   useEffect(() => {
     fetchHistory();
+    fetchTrendHistory();
     fetchBaselines();
     (async () => {
       try {
-        const res = await fetch(apiUrl('/api/settings'));
+        const res = await fetch(apiUrl('/api/settings'), { headers: apiHeaders() });
         if (res.ok) {
           const s = await res.json();
           setBrand({
@@ -116,6 +186,25 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const tick = async () => {
+      try {
+        const res = await fetch(apiUrl('/api/health'), { headers: apiHeaders() });
+        if (res.ok) {
+          setManagerHealth({ ok: true, message: '' });
+        } else {
+          const t = await res.text();
+          setManagerHealth({ ok: false, message: `HTTP ${res.status} ${t.slice(0, 120)}` });
+        }
+      } catch (e) {
+        setManagerHealth({ ok: false, message: e?.message || 'Unreachable' });
+      }
+    };
+    tick();
+    const id = setInterval(tick, 8000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
     if (history.length > 0 && selectedTest == null) {
       setSelectedTest(history[0].test_id);
     }
@@ -127,7 +216,7 @@ export default function App() {
       return;
     }
     try {
-      const res = await fetch(apiUrl(`/api/tests/${testId}/intelligence`));
+      const res = await fetch(apiUrl(`/api/tests/${testId}/intelligence`), { headers: apiHeaders() });
       if (res.ok) {
         const data = await res.json();
         setIntelligence(data);
@@ -144,30 +233,75 @@ export default function App() {
   const runTest = async () => {
     setRunning(true);
     setError('');
+    const totalReq = parseInt(config.total_requests, 10);
+    setRunProgress({ done: 0, total: Math.max(1, totalReq) });
     const ramp = config.load_profile === 'ramp';
     try {
       const res = await fetch(apiUrl('/api/tests/run'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...apiHeaders() },
         body: JSON.stringify({
-          target_url: 'http://localhost:8000',
+          target_url: DEFAULT_TARGET_URL,
           endpoint: config.endpoint,
           method: METHODS[config.endpoint] || 'GET',
-          total_requests: parseInt(config.total_requests, 10),
+          total_requests: totalReq,
           concurrency: parseInt(config.concurrency, 10),
           load_profile: config.load_profile,
           ramp_peak_concurrency: ramp ? parseInt(config.ramp_peak_concurrency, 10) : null,
           ramp_steps: ramp ? parseInt(config.ramp_steps, 10) : 5,
         }),
       });
-      const data = await res.json();
-      await fetchHistory();
-      setSelectedTest(data.test_id);
-      if (data.intelligence) setIntelligence(data.intelligence);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = body.detail;
+        let msg = `Request failed (${res.status})`;
+        if (typeof detail === 'string') msg = detail;
+        else if (Array.isArray(detail)) msg = detail.map((d) => d.msg || JSON.stringify(d)).join('; ');
+        else if (detail && typeof detail === 'object') msg = JSON.stringify(detail);
+        setError(msg);
+        setRunProgress(null);
+        setRunning(false);
+        return;
+      }
+      const { job_id: jobId } = body;
+      if (!jobId) {
+        setError('No job_id from server');
+        setRunProgress(null);
+        setRunning(false);
+        return;
+      }
+      const result = await new Promise((resolve, reject) => {
+        const poll = async () => {
+          try {
+            const r = await fetch(apiUrl(`/api/tests/jobs/${jobId}`), { headers: apiHeaders() });
+            const j = await r.json();
+            setRunProgress({
+              done: j.progress ?? 0,
+              total: Math.max(1, j.total ?? totalReq),
+            });
+            if (j.status === 'completed' && j.result) {
+              resolve(j.result);
+            } else if (j.status === 'failed') {
+              reject(new Error(j.error || 'Load test failed'));
+            } else {
+              setTimeout(poll, 450);
+            }
+          } catch (e) {
+            reject(e);
+          }
+        };
+        poll();
+      });
+      await fetchHistory(0);
+      await fetchTrendHistory();
+      setHistoryPage(0);
+      setSelectedTest(result.test_id);
+      if (result.intelligence) setIntelligence(result.intelligence);
     } catch (e) {
       setError('Test failed: ' + e.message);
     }
     setRunning(false);
+    setRunProgress(null);
   };
 
   const pinBaseline = async () => {
@@ -175,7 +309,7 @@ export default function App() {
     try {
       await fetch(apiUrl('/api/baselines'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...apiHeaders() },
         body: JSON.stringify({ test_id: selectedTest }),
       });
       await fetchBaselines();
@@ -189,7 +323,10 @@ export default function App() {
     const row = history.find((h) => h.test_id === selectedTest);
     if (!row?.endpoint_url) return;
     try {
-      await fetch(apiUrl(`/api/baselines?endpoint_url=${encodeURIComponent(row.endpoint_url)}`), { method: 'DELETE' });
+      await fetch(apiUrl(`/api/baselines?endpoint_url=${encodeURIComponent(row.endpoint_url)}`), {
+        method: 'DELETE',
+        headers: apiHeaders(),
+      });
       await fetchBaselines();
       await fetchIntelligence(selectedTest);
     } catch (e) {
@@ -209,7 +346,7 @@ export default function App() {
     const path = `/api/export/history.${ext}`;
     const url = apiUrl(path);
     try {
-      const res = await fetch(url, { method: 'GET' });
+      const res = await fetch(url, { method: 'GET', headers: apiHeaders() });
       if (!res.ok) throw new Error(String(res.status));
       const blob = await res.blob();
       const href = URL.createObjectURL(blob);
@@ -226,7 +363,7 @@ export default function App() {
     }
   };
 
-  const chartData = history
+  const chartData = trendHistory
     .slice(0, 15)
     .reverse()
     .map((t, i) => ({
@@ -269,6 +406,13 @@ export default function App() {
           </div>
         </div>
         <div className="header-actions">
+          <div
+            className={`manager-health ${managerHealth.ok ? 'manager-health--ok' : 'manager-health--bad'}`}
+            title={managerHealth.ok ? 'Manager API reachable' : managerHealth.message}
+          >
+            <span className="manager-health-dot" aria-hidden />
+            {managerHealth.ok ? 'Manager online' : 'Manager offline'}
+          </div>
           <div className="export-links">
             <button type="button" className="export-btn" onClick={() => downloadExport('csv')}>
               CSV
@@ -280,6 +424,12 @@ export default function App() {
         </div>
       </header>
 
+      {!managerHealth.ok && (
+        <div className="error-banner error-banner--health">
+          <strong>Cannot reach manager API.</strong> {managerHealth.message} — start the stack (see README):{' '}
+          <code>docker compose up --build</code> or run <code>uvicorn</code> in manager-api on port 8001.
+        </div>
+      )}
       {error && <div className="error-banner">{error}</div>}
 
       <div className="app-main">
@@ -390,6 +540,21 @@ export default function App() {
             <button className="btn-primary" type="button" onClick={runTest} disabled={running}>
               {running ? 'Running…' : 'Run audit'}
             </button>
+            {runProgress && running && (
+              <div className="run-progress" aria-live="polite">
+                <div className="run-progress-bar">
+                  <div
+                    className="run-progress-fill"
+                    style={{
+                      width: `${Math.min(100, (100 * runProgress.done) / Math.max(1, runProgress.total))}%`,
+                    }}
+                  />
+                </div>
+                <span className="run-progress-label">
+                  {runProgress.done} / {runProgress.total} requests
+                </span>
+              </div>
+            )}
           </section>
 
           <section className="panel">
@@ -491,10 +656,21 @@ export default function App() {
                   Clear baseline for this URL
                 </button>
               </div>
-              {baselineForUrl && (
-                <p className="mono-sm" style={{ marginTop: '8px' }}>
-                  Pinned baseline for this URL: {baselineForUrl.baseline_test_id?.slice(0, 8)}…
+              {baselineForUrl && baselineForUrl.baseline_snapshot && (
+                <p className="baseline-hint">
+                  Comparing to baseline run from <strong>{formatTs(baselineForUrl.baseline_snapshot.timestamp)}</strong> (avg{' '}
+                  {baselineForUrl.baseline_snapshot.avg_latency} ms · P99 {baselineForUrl.baseline_snapshot.p99_latency} ms).
                 </p>
+              )}
+              {intelligence.ai_summary && (
+                <div className="intel-block ai-summary-block">
+                  <span className="field-label">AI summary</span>
+                  <p className="ai-summary-headline">{intelligence.ai_summary.headline}</p>
+                  <p className="mono-sm">
+                    Confidence ~{(intelligence.ai_summary.confidence * 100).toFixed(0)}% · {intelligence.ai_summary.history_points}{' '}
+                    history point(s). {intelligence.ai_summary.hint}
+                  </p>
+                </div>
               )}
               <div className="insights-grid">
                 <div>
@@ -652,8 +828,91 @@ export default function App() {
               <h2 className="panel-title" style={{ marginBottom: 0 }}>
                 History
               </h2>
-              <button type="button" className="btn-ghost" onClick={fetchHistory}>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => {
+                  fetchHistory(historyPage);
+                  fetchTrendHistory();
+                }}
+              >
                 Refresh
+              </button>
+            </div>
+            <div className="history-filters">
+              <input
+                type="search"
+                className="input input--sm"
+                placeholder="Search path, method, run id…"
+                value={historyFilter.q}
+                onChange={(e) => setHistoryFilter({ ...historyFilter, q: e.target.value })}
+                aria-label="Filter history"
+              />
+              <select
+                className="select select--sm"
+                value={historyFilter.status}
+                onChange={(e) => setHistoryFilter({ ...historyFilter, status: e.target.value })}
+                aria-label="SLA status"
+              >
+                <option value="">All SLA</option>
+                <option value="PASS">PASS</option>
+                <option value="WARN">WARN</option>
+                <option value="FAIL">FAIL</option>
+              </select>
+              <input
+                type="datetime-local"
+                className="input input--sm"
+                value={historyFilter.from_ts}
+                onChange={(e) => setHistoryFilter({ ...historyFilter, from_ts: e.target.value })}
+                aria-label="From time"
+              />
+              <input
+                type="datetime-local"
+                className="input input--sm"
+                value={historyFilter.to_ts}
+                onChange={(e) => setHistoryFilter({ ...historyFilter, to_ts: e.target.value })}
+                aria-label="To time"
+              />
+              <button
+                type="button"
+                className="btn-ghost btn-ghost--sm"
+                onClick={() => {
+                  setHistoryPage(0);
+                  fetchHistory(0);
+                }}
+              >
+                Apply filters
+              </button>
+            </div>
+            <div className="history-pager">
+              <span className="mono-sm">
+                {historyTotal === 0
+                  ? '0 of 0'
+                  : `${historyPage * historyLimit + 1}–${Math.min(historyTotal, (historyPage + 1) * historyLimit)} of ${historyTotal}`}
+              </span>
+              <button
+                type="button"
+                className="btn-ghost btn-ghost--sm"
+                disabled={historyPage <= 0}
+                onClick={() => {
+                  const p = historyPage - 1;
+                  setHistoryPage(p);
+                  fetchHistory(p);
+                }}
+              >
+                Prev
+              </button>
+              <button
+                type="button"
+                className="btn-ghost btn-ghost--sm"
+                disabled={(historyPage + 1) * historyLimit >= historyTotal}
+                onClick={() => {
+                  const p = historyPage + 1;
+                  setHistoryPage(p);
+                  fetchHistory(p);
+                }}
+              >
+                Next
               </button>
             </div>
             {history.length === 0 ? (
@@ -686,7 +945,9 @@ export default function App() {
                         >
                           <td>
                             <span className="method-tag">{test.method}</span>
-                            {test.endpoint_url.replace('http://localhost:8000', '')}
+                            {test.endpoint_url
+                            .replace(/^https?:\/\/localhost:8000/, '')
+                            .replace(/^https?:\/\/target-api:8000/, '')}
                           </td>
                           <td className="mono-sm">{test.load_profile || 'flat'}</td>
                           <td>{test.total_requests}</td>

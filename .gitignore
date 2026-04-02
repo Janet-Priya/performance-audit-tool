@@ -1,4 +1,38 @@
-node-modules/
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# Env and local secrets (keep tracked examples)
+.env
+.env.local
+.env.*.local
+!**/.env.example
+
+# Databases (local / dev)
+*.db
+*.db-wal
+*.db-shm
+
+# Frontend build output (CI builds this)
+dashboard/build/
+
+# Tooling / IDE
 .cache/
 dist/
-.env
+.idea/
+.vscode/
+*.log
+.cursor/debug*.log
+
+# OS
+.DS_Store
+Thumbs.db

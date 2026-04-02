@@ -1,17 +1,23 @@
+import os
 import sqlite3
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-DB_PATH = "results.db"
+DB_PATH = os.environ.get("AUDIT_DB_PATH", "results.db")
 
 
 def _conn():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    return conn
 
 
 def init_db():
     conn = _conn()
     cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS test_runs (
@@ -117,6 +123,47 @@ def get_all_tests():
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return rows
+
+
+def get_tests_filtered(
+    q: str = "",
+    status: Optional[str] = None,
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Filter history; returns (page of rows, total matching count)."""
+    conn = _conn()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    conditions: List[str] = []
+    params: List[Any] = []
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        conditions.append("(endpoint_url LIKE ? OR method LIKE ? OR test_id LIKE ?)")
+        params.extend([like, like, like])
+    if status and status.strip():
+        conditions.append("status = ?")
+        params.append(status.strip().upper())
+    if from_ts and from_ts.strip():
+        conditions.append("timestamp >= ?")
+        params.append(from_ts.strip())
+    if to_ts and to_ts.strip():
+        conditions.append("timestamp <= ?")
+        params.append(to_ts.strip())
+    where_sql = " AND ".join(conditions) if conditions else "1=1"
+
+    cursor.execute(f"SELECT COUNT(*) FROM test_runs WHERE {where_sql}", params)
+    total = int(cursor.fetchone()[0])
+
+    cursor.execute(
+        f"SELECT * FROM test_runs WHERE {where_sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows, total
 
 
 def get_test_by_id(test_id: str):

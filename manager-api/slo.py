@@ -40,9 +40,21 @@ def compute_slo_bundle(
     bad = sum(1 for r in window if not _run_meets_slo(float(r["p99_latency"]), float(r["error_rate"])))
     budget_remaining = max(0.0, 100.0 * (1.0 - bad / max(1, len(window))))
 
-    half = max(1, len(window) // 2)
-    first = window[:half]
-    second = window[half:]
+    # Split window; avoid empty "second" (e.g. len==1 with half=1 => second []) which caused division by zero.
+    mid = len(window) // 2
+    if mid < 1:
+        mid = 1
+    first = window[:mid]
+    second = window[mid:]
+    if not second:
+        return {
+            "targets": {"p99_ms": P99_TARGET_MS, "max_error_pct": ERROR_BUDGET_PCT},
+            "current_meets_slo": meets,
+            "error_budget_remaining_pct": round(budget_remaining, 2),
+            "burn_rate": None,
+            "window_runs": len(window),
+            "bad_runs_in_window": bad,
+        }
     bad_first = sum(1 for r in first if not _run_meets_slo(float(r["p99_latency"]), float(r["error_rate"])))
     bad_second = sum(1 for r in second if not _run_meets_slo(float(r["p99_latency"]), float(r["error_rate"])))
     rate_first = bad_first / len(first)

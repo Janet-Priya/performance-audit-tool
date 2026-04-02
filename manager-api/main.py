@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
@@ -7,18 +7,14 @@ import html
 import io
 import json
 import os
-import time
-import uuid
-from datetime import datetime
 from typing import Optional
 
-import engine
 import database
-import intelligence
-import slo
-import diagnostics
 import dependencies
-import analysis
+import jobs
+import rate_limit
+import security
+import target_validation
 import config as app_config
 
 app = FastAPI(title=app_config.api_title())
@@ -72,80 +68,73 @@ class PinBaselineBody(BaseModel):
     test_id: str
 
 
-def build_intelligence_bundle(test_row: dict, hist: list) -> dict:
-    intel = intelligence.analyze_endpoint_history(hist)
-    baseline_id = database.get_baseline_for_endpoint(test_row["endpoint_url"])
-    baseline_row = database.get_test_by_id(baseline_id) if baseline_id else None
-    intel["slo"] = slo.compute_slo_bundle(test_row, hist)
-    intel["regression"] = analysis.regression_vs_baseline(test_row, baseline_row)
-    intel["diagnostics"] = diagnostics.multi_signal_analysis(test_row, baseline_row)
-    intel["dependencies"] = dependencies.blast_radius_for_path(
-        dependencies.path_from_url(test_row["endpoint_url"])
-    )
-    return intel
+def _rate_limit_dep(request: Request) -> None:
+    rate_limit.check_run_rate_limit(request)
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "service": "latency-audit-manager"}
 
 
 @app.post("/api/tests/run")
-async def run_test(config: TestConfig):
-    t0 = time.perf_counter()
-    results = await engine.run_load_test(
-        config.target_url,
+async def run_test(
+    config: TestConfig,
+    _auth: None = Depends(security.require_api_key),
+    _rl: None = Depends(_rate_limit_dep),
+):
+    resolved = target_validation.resolve_target_url(config.target_url)
+    target_validation.validate_target_url(resolved)
+    is_ramp = (config.load_profile or "").lower() == "ramp"
+    job_id = jobs.schedule_job(
+        resolved,
         config.endpoint,
         config.method,
         config.total_requests,
         config.concurrency,
         load_profile=config.load_profile,
-        ramp_peak_concurrency=config.ramp_peak_concurrency,
-        ramp_steps=config.ramp_steps,
+        ramp_peak_concurrency=config.ramp_peak_concurrency if is_ramp else None,
+        ramp_steps=config.ramp_steps if is_ramp else 5,
     )
-    wall = time.perf_counter() - t0
-    stats = engine.calculate_statistics(results)
+    return {"job_id": job_id}
 
-    avg = stats["avg_latency"]
-    if avg < 200:
-        status = "PASS"
-    elif avg < 500:
-        status = "WARN"
-    else:
-        status = "FAIL"
 
-    test_id = str(uuid.uuid4())
-    endpoint_url = config.target_url.rstrip("/") + config.endpoint
-
-    is_ramp = (config.load_profile or "").lower() == "ramp"
-    record = {
-        "test_id": test_id,
-        "endpoint_url": endpoint_url,
-        "method": config.method.upper(),
-        "total_requests": config.total_requests,
-        "concurrency": config.concurrency,
-        "avg_latency": stats["avg_latency"],
-        "p50_latency": stats["p50_latency"],
-        "p99_latency": stats["p99_latency"],
-        "min_latency": stats["min_latency"],
-        "max_latency": stats["max_latency"],
-        "success_rate": stats["success_rate"],
-        "error_rate": stats["error_rate"],
-        "throughput_rps": stats["throughput_rps"],
-        "status": status,
-        "timestamp": datetime.utcnow().isoformat(),
-        "load_profile": (config.load_profile or "flat").lower(),
-        "ramp_peak_concurrency": config.ramp_peak_concurrency if is_ramp else None,
-        "ramp_steps": config.ramp_steps if is_ramp else None,
-        "wall_duration_sec": round(wall, 3),
+@app.get("/api/tests/jobs/{job_id}")
+def get_job_status(job_id: str):
+    j = jobs.get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out = {
+        "job_id": j.id,
+        "status": j.status,
+        "progress": j.progress,
+        "total": j.total,
     }
-    database.save_test_result(record)
-    database.append_audit("test_run", f"{endpoint_url} profile={record['load_profile']}")
-
-    hist = database.get_recent_by_endpoint(endpoint_url, limit=25)
-    intel = build_intelligence_bundle(record, hist)
-
-    return {"test_id": test_id, "status": status, **stats, "wall_duration_sec": record["wall_duration_sec"], "intelligence": intel}
+    if j.error:
+        out["error"] = j.error
+    if j.status == "completed" and j.result:
+        out["result"] = j.result
+    return out
 
 
 @app.get("/api/tests/history")
-def get_history():
-    return database.get_all_tests()
+def get_history(
+    q: str = Query("", description="Search endpoint URL, method, or test id"),
+    status: Optional[str] = Query(None, description="PASS, WARN, or FAIL"),
+    from_ts: Optional[str] = Query(None, description="ISO timestamp lower bound"),
+    to_ts: Optional[str] = Query(None, description="ISO timestamp upper bound"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    items, total = database.get_tests_filtered(
+        q=q,
+        status=status,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        limit=limit,
+        offset=offset,
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/api/tests/{test_id}")
@@ -164,11 +153,11 @@ def get_test_intelligence(test_id: str):
     hist = database.get_endpoint_history_chronological_upto(result["endpoint_url"], test_id, limit=40)
     if not hist:
         hist = [result]
-    return build_intelligence_bundle(result, hist)
+    return jobs.build_intelligence_bundle(result, hist)
 
 
 @app.post("/api/baselines")
-def pin_baseline(body: PinBaselineBody):
+def pin_baseline(body: PinBaselineBody, _auth: None = Depends(security.require_api_key)):
     t = database.get_test_by_id(body.test_id)
     if not t:
         raise HTTPException(status_code=404, detail="Test not found")
@@ -188,7 +177,10 @@ def get_baselines():
 
 
 @app.delete("/api/baselines")
-def delete_baseline(endpoint_url: str = Query(..., description="Full endpoint URL as stored, e.g. http://localhost:8000/login")):
+def delete_baseline(
+    endpoint_url: str = Query(..., description="Full endpoint URL as stored, e.g. http://localhost:8000/login"),
+    _auth: None = Depends(security.require_api_key),
+):
     ok = database.clear_baseline(endpoint_url)
     if not ok:
         raise HTTPException(status_code=404, detail="No baseline for that URL")

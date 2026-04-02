@@ -1,7 +1,9 @@
 import asyncio
 import aiohttp
 import time
-from typing import Optional
+from typing import Callable, Optional
+
+ProgressCb = Optional[Callable[[int, int], None]]
 
 
 async def send_single_request(session, url, method):
@@ -41,12 +43,27 @@ async def send_single_request(session, url, method):
         }
 
 
-async def _run_batch(session, full_url, method, total_requests, concurrency):
+async def _run_batch(
+    session,
+    full_url,
+    method,
+    total_requests,
+    concurrency,
+    progress_callback: ProgressCb = None,
+    progress_total: Optional[int] = None,
+    progress_offset: int = 0,
+):
+    total = progress_total if progress_total is not None else total_requests
     semaphore = asyncio.Semaphore(concurrency)
+    completed = [0]
 
     async def bounded_request():
         async with semaphore:
-            return await send_single_request(session, full_url, method)
+            r = await send_single_request(session, full_url, method)
+            completed[0] += 1
+            if progress_callback:
+                progress_callback(progress_offset + completed[0], total)
+            return r
 
     tasks = [bounded_request() for _ in range(total_requests)]
     return await asyncio.gather(*tasks)
@@ -61,6 +78,7 @@ async def run_load_test(
     load_profile: str = "flat",
     ramp_peak_concurrency: Optional[int] = None,
     ramp_steps: int = 5,
+    progress_callback: ProgressCb = None,
 ):
     """
     flat: fixed concurrency for all requests.
@@ -73,7 +91,16 @@ async def run_load_test(
     if profile != "ramp":
         connector = aiohttp.TCPConnector(limit=concurrency + 10)
         async with aiohttp.ClientSession(connector=connector) as session:
-            out = await _run_batch(session, full_url, method, total_requests, concurrency)
+            out = await _run_batch(
+                session,
+                full_url,
+                method,
+                total_requests,
+                concurrency,
+                progress_callback=progress_callback,
+                progress_total=total_requests,
+                progress_offset=0,
+            )
         return list(out)
 
     steps = max(2, int(ramp_steps))
@@ -81,13 +108,24 @@ async def run_load_test(
     rem = total_requests % steps
     results = []
     connector = aiohttp.TCPConnector(limit=peak + 10)
+    done_before = 0
     async with aiohttp.ClientSession(connector=connector) as session:
         for i in range(steps):
             conc = max(1, int(round(peak * (i + 1) / steps)))
             n_req = base + (1 if i < rem else 0)
             if n_req <= 0:
                 continue
-            part = await _run_batch(session, full_url, method, n_req, conc)
+            part = await _run_batch(
+                session,
+                full_url,
+                method,
+                n_req,
+                conc,
+                progress_callback=progress_callback,
+                progress_total=total_requests,
+                progress_offset=done_before,
+            )
+            done_before += n_req
             results.extend(part)
     return results
 

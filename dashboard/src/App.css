@@ -492,6 +492,117 @@
   font-size: 0.8125rem;
 }
 
+.error-banner--health {
+  background: rgba(127, 29, 29, 0.35);
+}
+
+.manager-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.manager-health--ok {
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+.manager-health--bad {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(248, 113, 113, 0.25);
+}
+
+.manager-health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 10px currentColor;
+}
+
+.run-progress {
+  margin-top: 12px;
+}
+
+.run-progress-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.15);
+  overflow: hidden;
+}
+
+.run-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #38bdf8, #a78bfa);
+  transition: width 0.2s ease;
+}
+
+.run-progress-label {
+  display: block;
+  margin-top: 6px;
+  font-size: 0.72rem;
+  color: var(--muted2);
+}
+
+.history-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.history-filters .input--sm,
+.history-filters .select--sm {
+  flex: 1 1 140px;
+  min-width: 120px;
+  margin-bottom: 0;
+}
+
+.input--sm,
+.select--sm {
+  padding: 8px 10px;
+  font-size: 0.8125rem;
+}
+
+.btn-ghost--sm {
+  padding: 8px 12px;
+  font-size: 0.75rem;
+}
+
+.history-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  color: var(--muted2);
+}
+
+.baseline-hint {
+  margin: 10px 0 0;
+  font-size: 0.8125rem;
+  color: var(--muted);
+  line-height: 1.5;
+  max-width: 72ch;
+}
+
+.ai-summary-block .ai-summary-headline {
+  margin: 6px 0 8px;
+  font-size: 0.9rem;
+  color: var(--text);
+  line-height: 1.45;
+}
+
 .intel-footnote {
   margin: 0 0 14px;
   font-size: 0.78rem;

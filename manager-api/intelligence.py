@@ -230,7 +230,13 @@ def analyze_endpoint_history(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     if not rows:
         return {
-            "engine": "composite_latency_intelligence_v1",
+            "engine": "composite_latency_intelligence_v2",
+            "ai_summary": {
+                "headline": "No history for this endpoint yet — run a few audits to unlock trend and anomaly models.",
+                "confidence": 0.0,
+                "history_points": 0,
+                "hint": f"Isolation forest needs at least {MIN_SAMPLES_IF} runs with history.",
+            },
             "anomaly": {"is_anomaly": False, "score": None, "method": "none"},
             "forecast": {"next_p99_ms": None, "slope_ms_per_run": None, "stderr_hint": None, "usable": False},
             "composite_risk": 0,
@@ -252,8 +258,30 @@ def analyze_endpoint_history(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     recs = _recommendations(rows, is_anom, forecast, avg_ms, p99_ms, err, slope)
     explain = explain_deviation_from_training(rows)
 
+    n = len(rows)
+    confidence = round(min(1.0, n / 18.0) * (0.85 if n >= MIN_SAMPLES_IF else 0.45), 3)
+    headline_parts = [
+        f"Latest run: avg {avg_ms:.0f} ms, P99 {p99_ms:.0f} ms, {err:.1f}% errors across {n} recent point(s).",
+    ]
+    if is_anom:
+        headline_parts.append("Multivariate model flags this profile as unusual vs recent history.")
+    else:
+        headline_parts.append("Profile is within the expected envelope for this endpoint.")
+    if forecast.get("usable") and forecast.get("next_p99_ms") is not None:
+        headline_parts.append(
+            f"Linear trend suggests next P99 near {forecast['next_p99_ms']:.0f} ms if behavior continues."
+        )
+    ai_headline = " ".join(headline_parts)[:520]
+
     return {
-        "engine": "composite_latency_intelligence_v1",
+        "engine": "composite_latency_intelligence_v2",
+        "ai_summary": {
+            "headline": ai_headline,
+            "confidence": confidence,
+            "history_points": n,
+            "hint": "Higher confidence needs more runs per endpoint; isolation forest activates with "
+            f"{MIN_SAMPLES_IF}+ samples.",
+        },
         "anomaly": {
             "is_anomaly": bool(is_anom),
             "score": None if anom_score is None else round(float(anom_score), 4),
